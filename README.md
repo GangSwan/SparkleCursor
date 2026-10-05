@@ -7,6 +7,7 @@ A tiny Windows tray app that makes sparkles flutter from your mouse cursor as it
   - 8 palettes, including Custom with three colours you pick
   - 9 sprites: Sparkle, Star, Heart, Diamond, Orb, Snowflake, Ring, Glint, Confetti
   - Sliders for density, size, lifetime, gravity (negative floats upward), flutter, spread, glow and twinkle
+  - Click effects: Fireworks (peony, ring, willow and crackle bursts), Burst, Ripple, Confetti, Hearts or Random, with a Power slider and an optional right-click trigger
   - Optional Start with Windows
 - A single ~90 KB exe with no dependencies. It runs on the .NET Framework 4.x that comes with Windows 10 and 11
 

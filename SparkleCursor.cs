@@ -55,6 +55,8 @@ enum Palette { Rainbow, Gold, Ice, Pink, Aurora, Fire, Pastel, Custom }
 [Flags]
 enum Sprite { Sparkle = 1, Star = 2, Heart = 4, Diamond = 8, Orb = 16, Snowflake = 32, Ring = 64, Glint = 128, Confetti = 256 }
 
+enum ClickEffect { Fireworks, Burst, Ripple, Confetti, Hearts, Random, None }
+
 class Settings
 {
     const string Key = @"Software\SparkleCursor";
@@ -63,6 +65,9 @@ class Settings
     public Color[] Custom = { Color.FromArgb(255, 122, 200), Color.FromArgb(120, 190, 255), Color.FromArgb(255, 225, 120) };
     public int Sprites = (int)(Sprite.Sparkle | Sprite.Star | Sprite.Orb | Sprite.Glint);
     public float Density = 1, SpriteSize = 1, Lifetime = 1, Gravity = 140, Flutter = 1, Spread = 1, Glow = 1, Twinkle = 1;
+    public ClickEffect ClickEffect = ClickEffect.Fireworks;
+    public float ClickPower = 1;
+    public bool ClickRight;
     public bool Enabled = true, Welcomed;
 
     public bool Has(Sprite sp) { return (Sprites & (int)sp) != 0; }
@@ -73,6 +78,7 @@ class Settings
         Palette = d.Palette; Custom = d.Custom; Sprites = d.Sprites;
         Density = d.Density; SpriteSize = d.SpriteSize; Lifetime = d.Lifetime; Gravity = d.Gravity;
         Flutter = d.Flutter; Spread = d.Spread; Glow = d.Glow; Twinkle = d.Twinkle;
+        ClickEffect = d.ClickEffect; ClickPower = d.ClickPower; ClickRight = d.ClickRight;
     }
 
     public void Load()
@@ -82,7 +88,10 @@ class Settings
             using (var k = Registry.CurrentUser.OpenSubKey(Key))
             {
                 if (k == null) return;
-                Palette = (Palette)Enum.Parse(typeof(Palette), Str(k, "Palette", Str(k, "Mode", Palette.ToString())));
+                Palette = En(k, "Palette", En(k, "Mode", Palette));
+                ClickEffect = En(k, "ClickEffect", ClickEffect);
+                ClickPower = Flt(k, "ClickPower", ClickPower);
+                ClickRight = Int(k, "ClickRight", 0) != 0;
                 for (int i = 0; i < Custom.Length; i++) Custom[i] = Color.FromArgb(Int(k, "Custom" + i, Custom[i].ToArgb()));
                 Sprites = Int(k, "Sprites", Sprites);
                 Density = Flt(k, "Density", Density);
@@ -107,6 +116,9 @@ class Settings
             using (var k = Registry.CurrentUser.CreateSubKey(Key))
             {
                 k.SetValue("Palette", Palette.ToString());
+                k.SetValue("ClickEffect", ClickEffect.ToString());
+                SetF(k, "ClickPower", ClickPower);
+                k.SetValue("ClickRight", ClickRight ? 1 : 0, RegistryValueKind.DWord);
                 for (int i = 0; i < Custom.Length; i++) k.SetValue("Custom" + i, Custom[i].ToArgb(), RegistryValueKind.DWord);
                 k.SetValue("Sprites", Sprites, RegistryValueKind.DWord);
                 SetF(k, "Density", Density); SetF(k, "Size", SpriteSize); SetF(k, "Lifetime", Lifetime);
@@ -122,6 +134,11 @@ class Settings
 
     static string Str(RegistryKey k, string n, string d) { var v = k.GetValue(n) as string; return v ?? d; }
     static int Int(RegistryKey k, string n, int d) { var v = k.GetValue(n); return v is int ? (int)v : d; }
+    static T En<T>(RegistryKey k, string n, T d) where T : struct
+    {
+        try { return (T)Enum.Parse(typeof(T), Str(k, n, d.ToString())); }
+        catch { return d; }
+    }
     static float Flt(RegistryKey k, string n, float d)
     {
         float f;
@@ -156,19 +173,32 @@ static class Startup
 // Particles
 // ======================================================================
 
+enum PKind { Sprite, Rocket, Spark, Ripple, Flash }
+
 class Particle
 {
+    public PKind Kind;
     public float X, Y, VX, VY, Age, Life, Size, Rot, Spin, Phase, WobbleAmp, WobbleFreq, FlipFreq;
     public Sprite Sp;
-    public Color Col;
+    public Color Col, Col2;
+    public int Style;     // rocket: burst style
+    public bool Crackle;  // spark: flickers as it dies
+
+    // Click-effect particles carry their own physics instead of following the trail sliders.
+    public bool Own;
+    public float G, DragX = 0.25f, DragY = 0.55f, Flutter = 1f;
 }
 
 class ParticleSystem
 {
     public static readonly Sprite[] AllSprites = (Sprite[])Enum.GetValues(typeof(Sprite));
 
+    static readonly ClickEffect[] RandomPool = { ClickEffect.Fireworks, ClickEffect.Burst, ClickEffect.Ripple, ClickEffect.Confetti, ClickEffect.Hearts };
+
     public readonly List<Particle> Particles = new List<Particle>();
-    public int Max = 500;
+    public int Max = 500;         // cap for the cursor trail
+    public int HardMax = 2500;    // cap including click effects
+    public float EffectScale = 1; // shrinks click effects (used by the small preview)
     readonly Settings s;
     readonly float scale;
     readonly Random rng = new Random();
@@ -199,32 +229,216 @@ class ParticleSystem
         }
     }
 
-    void Spawn(float x, float y, float cvx, float cvy)
+    Sprite PickSprite()
     {
         enabled.Clear();
         foreach (var sp in AllSprites) if (s.Has(sp)) enabled.Add(sp);
-        if (enabled.Count == 0) enabled.Add(Sprite.Sparkle);
+        return enabled.Count == 0 ? Sprite.Sparkle : enabled[rng.Next(enabled.Count)];
+    }
 
+    Particle NewSprite(Sprite sp, float x, float y, float size, float unit)
+    {
         var p = new Particle
         {
-            Sp = enabled[rng.Next(enabled.Count)],
-            Col = NextColor(),
-            X = x + R(-4, 4) * scale,
-            Y = y + R(-4, 4) * scale,
-            VX = R(-70, 70) * s.Spread * scale - cvx * 0.04f,
-            VY = R(-90, 10) * s.Spread * scale - cvy * 0.04f,
-            Life = R(0.7f, 1.6f) * s.Lifetime,
-            Size = (rng.NextDouble() < 0.15 ? R(7, 11) : R(3, 7)) * s.SpriteSize * scale,
-            Rot = R(0, 360),
-            Spin = R(-200, 200),
-            Phase = R(0, 6.28f),
-            WobbleAmp = R(20, 60) * scale,
-            WobbleFreq = R(4, 9),
-            FlipFreq = R(6, 14),
+            Kind = PKind.Sprite, Sp = sp, X = x, Y = y, Size = size,
+            Rot = R(0, 360), Spin = R(-200, 200), Phase = R(0, 6.28f),
+            WobbleAmp = R(20, 60) * unit, WobbleFreq = R(4, 9), FlipFreq = R(6, 14),
         };
-        if (p.Sp == Sprite.Confetti) p.Spin = R(-420, 420);
-        if (p.Sp == Sprite.Glint) p.Spin *= 0.2f;
+        if (sp == Sprite.Confetti) p.Spin = R(-420, 420);
+        if (sp == Sprite.Glint) p.Spin *= 0.2f;
+        return p;
+    }
+
+    void Add(Particle p) { if (Particles.Count < HardMax) Particles.Add(p); }
+
+    void Spawn(float x, float y, float cvx, float cvy)
+    {
+        var p = NewSprite(PickSprite(), x + R(-4, 4) * scale, y + R(-4, 4) * scale,
+                          (rng.NextDouble() < 0.15 ? R(7, 11) : R(3, 7)) * s.SpriteSize * scale, scale);
+        p.Col = NextColor();
+        p.VX = R(-70, 70) * s.Spread * scale - cvx * 0.04f;
+        p.VY = R(-90, 10) * s.Spread * scale - cvy * 0.04f;
+        p.Life = R(0.7f, 1.6f) * s.Lifetime;
         Particles.Add(p);
+    }
+
+    // ---------- click effects ----------
+
+    // topLimit: y of the top of the screen (or preview) so rockets don't burst out of view.
+    public void Click(float x, float y, float topLimit)
+    {
+        var fx = s.ClickEffect;
+        if (fx == ClickEffect.Random) fx = RandomPool[rng.Next(RandomPool.Length)];
+        switch (fx)
+        {
+            case ClickEffect.Fireworks: Fireworks(x, y, topLimit); break;
+            case ClickEffect.Burst: Burst(x, y); break;
+            case ClickEffect.Ripple: Ripple(x, y); break;
+            case ClickEffect.Confetti: ConfettiPop(x, y); break;
+            case ClickEffect.Hearts: Hearts(x, y); break;
+        }
+    }
+
+    float FX { get { return scale * EffectScale; } }
+
+    void Flash(float x, float y, float size, Color c, float life)
+    {
+        Add(new Particle { Kind = PKind.Flash, X = x, Y = y, Size = size, Life = life, Col = c });
+    }
+
+    void Fireworks(float x, float y, float topLimit)
+    {
+        float k = FX, pw = s.ClickPower;
+        int rockets = pw >= 1.6f ? 3 : pw >= 1.15f ? 2 : 1;
+        for (int i = 0; i < rockets; i++)
+        {
+            float T = R(0.5f, 0.62f), G = 420 * k;
+            // climb height, kept below the top of the screen with room for the burst
+            float H = Math.Min(R(240, 340) * k, Math.Max(60 * k, (y - topLimit) - 170 * k));
+            var p = new Particle
+            {
+                Kind = PKind.Rocket, X = x, Y = y, Life = T, G = G, Size = 2.2f * k,
+                Age = -i * 0.22f, Phase = R(0, 6.28f), Style = rng.Next(4),
+                VX = (rockets == 1 ? R(-30, 30) : (i - (rockets - 1) / 2f) * R(70, 110)) * k,
+                VY = -(H + G * T * T / 2) / T,
+            };
+            hueCursor = (hueCursor + R(80, 160)) % 360;
+            p.Col = NextColor();
+            if (rng.NextDouble() < 0.35)
+            {
+                hueCursor = (hueCursor + R(90, 180)) % 360;
+                p.Col2 = NextColor();
+            }
+            Add(p);
+        }
+    }
+
+    void Explode(Particle p)
+    {
+        float k = FX, pw = s.ClickPower;
+        Flash(p.X, p.Y, (55 + 25 * pw) * k, Gfx.Blend(p.Col, Color.White, 0.5f), 0.22f);
+        int n = (int)(R(55, 75) * (0.6f + 0.4f * pw));
+        float speed = R(190, 240) * k * (0.75f + 0.25f * pw);
+        bool twoTone = p.Col2 != Color.Empty;
+        for (int i = 0; i < n; i++)
+        {
+            double ang = i * 2 * Math.PI / n + R(-0.06f, 0.06f);
+            Color c = twoTone && i % 2 == 1 ? p.Col2 : p.Col;
+            float sp, life = R(0.9f, 1.4f), g = 150 * k, drag = 0.35f;
+            switch (p.Style)
+            {
+                case 1: // ring
+                    sp = speed * R(0.96f, 1.04f);
+                    break;
+                case 2: // willow: slow, golden, drooping
+                    sp = speed * 0.8f * (float)Math.Sqrt(R(0.1f, 1));
+                    life = R(1.8f, 2.6f); g = 70 * k; drag = 0.3f;
+                    c = Gfx.Blend(Color.FromArgb(255, 196, 96), c, 0.25f);
+                    break;
+                default: // peony and crackle: filled sphere
+                    sp = speed * (float)Math.Sqrt(R(0.08f, 1));
+                    break;
+            }
+            Add(new Particle
+            {
+                Kind = PKind.Spark, X = p.X, Y = p.Y,
+                VX = (float)Math.Cos(ang) * sp, VY = (float)Math.Sin(ang) * sp,
+                G = g, DragX = drag, Life = life, Size = R(1.5f, 2.3f) * k, Col = c,
+                Crackle = p.Style == 3, Phase = R(0, 6.28f),
+            });
+        }
+        if (p.Style == 1) // inner ring
+        {
+            Color c2 = twoTone ? p.Col2 : Gfx.Blend(p.Col, Color.White, 0.5f);
+            for (int i = 0; i < n / 2; i++)
+            {
+                double ang = i * 4 * Math.PI / n;
+                float sp = speed * 0.5f;
+                Add(new Particle
+                {
+                    Kind = PKind.Spark, X = p.X, Y = p.Y,
+                    VX = (float)Math.Cos(ang) * sp, VY = (float)Math.Sin(ang) * sp,
+                    G = 150 * k, DragX = 0.35f, Life = R(0.8f, 1.1f), Size = 1.6f * k, Col = c2, Phase = R(0, 6.28f),
+                });
+            }
+        }
+    }
+
+    void Burst(float x, float y)
+    {
+        float k = FX, pw = s.ClickPower;
+        Flash(x, y, 45 * k * (0.7f + 0.3f * pw), Color.White, 0.18f);
+        int n = (int)(28 * pw) + 6;
+        for (int i = 0; i < n; i++)
+        {
+            double ang = R(0, 6.2832f);
+            float sp = R(180, 420) * k;
+            var p = NewSprite(PickSprite(), x, y, R(4, 9) * s.SpriteSize * k, k);
+            p.Own = true; p.G = 180 * k; p.DragX = p.DragY = 0.08f; p.Flutter = 0.5f;
+            p.VX = (float)Math.Cos(ang) * sp; p.VY = (float)Math.Sin(ang) * sp;
+            p.Life = R(0.8f, 1.4f);
+            p.Col = NextColor();
+            Add(p);
+        }
+    }
+
+    void Ripple(float x, float y)
+    {
+        float k = FX, pw = s.ClickPower;
+        var c = NextColor();
+        for (int i = 0; i < 3; i++)
+            Add(new Particle
+            {
+                Kind = PKind.Ripple, X = x, Y = y, Age = -i * 0.13f, Life = 0.9f,
+                Size = (70 + i * 22) * k * (0.7f + 0.3f * pw), WobbleAmp = 3.2f * k, // WobbleAmp = stroke width
+                Col = i == 1 ? Gfx.Blend(c, Color.White, 0.35f) : c,
+            });
+        int n = (int)(10 * pw) + 2;
+        for (int i = 0; i < n; i++)
+        {
+            double ang = i * 2 * Math.PI / n;
+            var p = NewSprite(Sprite.Glint, x + (float)Math.Cos(ang) * 8 * k, y + (float)Math.Sin(ang) * 8 * k, R(3, 5) * k, k);
+            p.Own = true; p.G = 0; p.DragX = p.DragY = 0.2f; p.Flutter = 0;
+            p.VX = (float)Math.Cos(ang) * 160 * k; p.VY = (float)Math.Sin(ang) * 160 * k;
+            p.Life = 0.7f;
+            p.Col = Gfx.Blend(c, Color.White, 0.4f);
+            Add(p);
+        }
+    }
+
+    void ConfettiPop(float x, float y)
+    {
+        float k = FX, pw = s.ClickPower;
+        int n = (int)(40 * pw) + 5;
+        for (int i = 0; i < n; i++)
+        {
+            double ang = -Math.PI / 2 + R(-0.7f, 0.7f);
+            float sp = R(350, 700) * k;
+            var p = NewSprite(Sprite.Confetti, x, y, R(4.5f, 7.5f) * s.SpriteSize * k, k);
+            p.Own = true; p.G = 650 * k; p.DragX = p.DragY = 0.05f; p.Flutter = 1.2f;
+            p.VX = (float)Math.Cos(ang) * sp; p.VY = (float)Math.Sin(ang) * sp;
+            p.Life = R(2f, 3f);
+            hueCursor = (hueCursor + R(40, 120)) % 360;
+            p.Col = NextColor();
+            Add(p);
+        }
+    }
+
+    void Hearts(float x, float y)
+    {
+        float k = FX, pw = s.ClickPower;
+        Flash(x, y, 30 * k, Color.FromArgb(255, 140, 190), 0.2f);
+        int n = (int)(9 * pw) + 3;
+        for (int i = 0; i < n; i++)
+        {
+            var p = NewSprite(Sprite.Heart, x + R(-10, 10) * k, y, R(6, 11) * s.SpriteSize * k, k);
+            p.Own = true; p.G = -50 * k; p.DragX = p.DragY = 0.3f; p.Flutter = 0.8f;
+            p.VX = R(-110, 110) * k; p.VY = R(-240, -90) * k;
+            p.Spin = R(-60, 60);
+            p.Life = R(1.4f, 2.2f);
+            p.Col = Gfx.Hsv(R(330, 370), R(0.45f, 0.7f), 1);
+            Add(p);
+        }
     }
 
     Color NextColor()
@@ -246,17 +460,62 @@ class ParticleSystem
     public void Update(float dt)
     {
         float dragX = (float)Math.Pow(0.25, dt), dragY = (float)Math.Pow(0.55, dt);
+        // Particles added during the loop (rocket trails, bursts) land past i and start next frame.
         for (int i = Particles.Count - 1; i >= 0; i--)
         {
             var p = Particles[i];
             p.Age += dt;
-            if (p.Age >= p.Life) { Particles.RemoveAt(i); continue; }
-            p.VY += s.Gravity * scale * dt;
-            p.VX *= dragX;
-            p.VY *= dragY;
-            p.X += (p.VX + (float)Math.Sin(p.Age * p.WobbleFreq + p.Phase) * p.WobbleAmp * s.Flutter) * dt;
-            p.Y += p.VY * dt;
-            p.Rot += p.Spin * dt;
+            if (p.Age < 0) continue; // delayed start
+            if (p.Age >= p.Life)
+            {
+                if (p.Kind == PKind.Rocket) Explode(p);
+                Particles.RemoveAt(i);
+                continue;
+            }
+            switch (p.Kind)
+            {
+                case PKind.Sprite:
+                    p.VY += (p.Own ? p.G : s.Gravity * scale) * dt;
+                    p.VX *= p.Own ? (float)Math.Pow(p.DragX, dt) : dragX;
+                    p.VY *= p.Own ? (float)Math.Pow(p.DragY, dt) : dragY;
+                    p.X += (p.VX + (float)Math.Sin(p.Age * p.WobbleFreq + p.Phase) * p.WobbleAmp * (p.Own ? p.Flutter : s.Flutter)) * dt;
+                    p.Y += p.VY * dt;
+                    p.Rot += p.Spin * dt;
+                    break;
+
+                case PKind.Rocket:
+                    p.VY += p.G * dt;
+                    p.X += p.VX * dt;
+                    p.Y += p.VY * dt;
+                    for (int t = 0; t < 2; t++)
+                        Add(new Particle
+                        {
+                            Kind = PKind.Spark, X = p.X + R(-1, 1) * FX, Y = p.Y,
+                            VX = R(-25, 25) * FX, VY = R(10, 70) * FX, G = 120 * FX, DragX = 0.3f,
+                            Life = R(0.25f, 0.45f), Size = 1.1f * FX, Col = Color.FromArgb(255, 214, 150), Phase = R(0, 6.28f),
+                        });
+                    break;
+
+                case PKind.Spark:
+                    float d = (float)Math.Pow(p.DragX, dt);
+                    p.VX *= d;
+                    p.VY = p.VY * d + p.G * dt;
+                    p.X += p.VX * dt;
+                    p.Y += p.VY * dt;
+                    break;
+            }
+        }
+    }
+
+    static float Extent(Particle p)
+    {
+        switch (p.Kind)
+        {
+            case PKind.Spark: return Math.Max(Math.Abs(p.VX), Math.Abs(p.VY)) * 0.05f + p.Size * 4;
+            case PKind.Rocket: return Math.Max(Math.Abs(p.VX), Math.Abs(p.VY)) * 0.05f + p.Size * 6;
+            case PKind.Ripple: return p.Size + p.WobbleAmp * 3 + 4;
+            case PKind.Flash: return p.Size * 1.2f + 2;
+            default: return p.Size * 2.6f;
         }
     }
 
@@ -265,7 +524,7 @@ class ParticleSystem
         float minX = float.MaxValue, minY = float.MaxValue, maxX = float.MinValue, maxY = float.MinValue;
         foreach (var p in Particles)
         {
-            float e = p.Size * 2.6f;
+            float e = Extent(p);
             minX = Math.Min(minX, p.X - e); minY = Math.Min(minY, p.Y - e);
             maxX = Math.Max(maxX, p.X + e); maxY = Math.Max(maxY, p.Y + e);
         }
@@ -277,7 +536,30 @@ class ParticleSystem
         float amp = 0.7f * s.Twinkle;
         foreach (var p in Particles)
         {
+            if (p.Age < 0) continue;
             float lt = p.Age / p.Life;
+            switch (p.Kind)
+            {
+                case PKind.Spark:
+                {
+                    float sa = Math.Min(1f, (1 - lt) * 1.5f);
+                    if (p.Crackle && lt > 0.5f && Math.Sin(now * 50 + p.Phase * 7) < 0) sa *= 0.1f;
+                    Gfx.DrawSpark(g, p.X - ox, p.Y - oy, p.VX, p.VY, p.Size, p.Col, sa, s.Glow);
+                    continue;
+                }
+                case PKind.Rocket:
+                    Gfx.DrawSpark(g, p.X - ox, p.Y - oy, p.VX, p.VY, p.Size, Color.FromArgb(255, 230, 190), 1f, s.Glow + 0.5f);
+                    continue;
+                case PKind.Flash:
+                    Gfx.DrawFlash(g, p.X - ox, p.Y - oy, p.Size * (0.6f + 0.5f * lt), p.Col, 1 - lt);
+                    continue;
+                case PKind.Ripple:
+                {
+                    float e = 1 - (1 - lt) * (1 - lt) * (1 - lt);
+                    Gfx.DrawRipple(g, p.X - ox, p.Y - oy, p.Size * e, Math.Max(1f, p.WobbleAmp * (1 - lt)), p.Col, 1 - lt, s.Glow);
+                    continue;
+                }
+            }
             float fadeIn = Math.Min(1f, p.Age / 0.08f);
             float fadeOut = 1f - lt * lt;
             float tw = 1f - amp * (0.5f - 0.5f * (float)Math.Sin(now * 18 + p.Phase * 3));
@@ -500,6 +782,141 @@ static class Gfx
                     break;
                 }
             }
+        }
+    }
+
+    static int Alpha(float a) { return Math.Max(0, Math.Min(255, (int)(a * 255))); }
+
+    // A firework spark: a short streak behind the head along its velocity, with a soft halo.
+    public static void DrawSpark(Graphics g, float x, float y, float vx, float vy, float size, Color c, float a, float glow)
+    {
+        if (a <= 0.004f || size < 0.2f) return;
+        float x0 = x - vx * 0.045f, y0 = y - vy * 0.045f;
+        if (glow > 0.01f)
+            using (var pen = new Pen(Color.FromArgb(Alpha(a * 0.28f * glow), c), size * 3.4f))
+            {
+                pen.StartCap = pen.EndCap = LineCap.Round;
+                g.DrawLine(pen, x0, y0, x, y);
+            }
+        using (var pen = new Pen(Color.FromArgb(Alpha(a), Blend(c, Color.White, 0.3f)), size))
+        {
+            pen.StartCap = pen.EndCap = LineCap.Round;
+            g.DrawLine(pen, x0, y0, x, y);
+        }
+        float h = size * 0.9f;
+        using (var b = new SolidBrush(Color.FromArgb(Alpha(a), 255, 255, 255)))
+            g.FillEllipse(b, x - h, y - h, h * 2, h * 2);
+    }
+
+    public static void DrawFlash(Graphics g, float x, float y, float r, Color c, float a)
+    {
+        if (a <= 0.004f || r < 1) return;
+        using (var path = new GraphicsPath())
+        {
+            path.AddEllipse(x - r, y - r, r * 2, r * 2);
+            using (var pb = new PathGradientBrush(path))
+            {
+                pb.CenterColor = Color.FromArgb(Alpha(a * 0.8f), c);
+                pb.SurroundColors = new[] { Color.FromArgb(0, c) };
+                g.FillPath(pb, path);
+            }
+        }
+    }
+
+    public static void DrawRipple(Graphics g, float x, float y, float r, float width, Color c, float a, float glow)
+    {
+        if (a <= 0.004f || r < 1) return;
+        if (glow > 0.01f)
+            using (var pen = new Pen(Color.FromArgb(Alpha(a * 0.25f * glow), c), width * 3))
+                g.DrawEllipse(pen, x - r, y - r, r * 2, r * 2);
+        using (var pen = new Pen(Color.FromArgb(Alpha(a * 0.9f), c), width))
+            g.DrawEllipse(pen, x - r, y - r, r * 2, r * 2);
+    }
+
+    // Small pictograms for the click-effect chips.
+    public static void DrawEffectIcon(Graphics g, RectangleF r, ClickEffect fx, bool sel)
+    {
+        float cx = r.X + r.Width / 2, cy = r.Y + r.Height / 2, u = Math.Min(r.Width, r.Height) / 2f;
+        var gray = Color.FromArgb(110, 104, 130);
+        Func<Color, Color> C = col => sel ? col : gray;
+        float glow = sel ? 0.8f : 0f, lw = Math.Max(1f, 1.5f * UI.S);
+        Color[] cols = { UI.A1, Color.FromArgb(255, 210, 110), UI.A3, UI.A2 };
+        switch (fx)
+        {
+            case ClickEffect.Fireworks:
+                for (int i = 0; i < 12; i++)
+                {
+                    double ang = i * Math.PI / 6;
+                    float ca = (float)Math.Cos(ang), sa = (float)Math.Sin(ang);
+                    using (var pen = new Pen(C(cols[i % cols.Length]), lw))
+                    {
+                        pen.StartCap = pen.EndCap = LineCap.Round;
+                        g.DrawLine(pen, cx + ca * u * 0.35f, cy + sa * u * 0.35f, cx + ca * u * 0.8f, cy + sa * u * 0.8f);
+                    }
+                }
+                using (var b = new SolidBrush(sel ? Color.White : gray)) g.FillEllipse(b, cx - lw, cy - lw, lw * 2, lw * 2);
+                break;
+
+            case ClickEffect.Burst:
+                DrawSprite(g, Sprite.Sparkle, cx, cy, u * 0.3f, 0, C(Color.FromArgb(255, 215, 110)), 1, glow, 0);
+                for (int i = 0; i < 6; i++)
+                {
+                    double ang = i * Math.PI / 3 + 0.5;
+                    DrawSprite(g, Sprite.Orb, cx + (float)Math.Cos(ang) * u * 0.8f, cy + (float)Math.Sin(ang) * u * 0.8f, u * 0.12f, 0, C(cols[i % cols.Length]), 1, 0, 0);
+                }
+                break;
+
+            case ClickEffect.Ripple:
+                for (int i = 0; i < 3; i++)
+                    using (var pen = new Pen(Color.FromArgb(255 - i * 75, C(UI.A3)), lw))
+                    {
+                        float rr = u * (0.3f + i * 0.27f);
+                        g.DrawEllipse(pen, cx - rr, cy - rr, rr * 2, rr * 2);
+                    }
+                break;
+
+            case ClickEffect.Confetti:
+                for (int i = 0; i < 6; i++)
+                {
+                    double ang = -Math.PI / 2 + (i - 2.5) * 0.45;
+                    float d = u * (i % 2 == 0 ? 0.75f : 0.45f);
+                    DrawSprite(g, Sprite.Confetti, cx + (float)Math.Cos(ang) * d, cy + u * 0.35f + (float)Math.Sin(ang) * d, u * 0.2f, i * 37, C(cols[i % cols.Length]), 1, 0, 0);
+                }
+                break;
+
+            case ClickEffect.Hearts:
+                DrawSprite(g, Sprite.Heart, cx - u * 0.45f, cy + u * 0.2f, u * 0.28f, -40, C(Color.FromArgb(255, 120, 170)), 1, glow, 0);
+                DrawSprite(g, Sprite.Heart, cx + u * 0.4f, cy - u * 0.2f, u * 0.36f, 40, C(Color.FromArgb(255, 90, 130)), 1, glow, 0);
+                DrawSprite(g, Sprite.Heart, cx - u * 0.05f, cy - u * 0.55f, u * 0.2f, 0, C(Color.FromArgb(255, 170, 210)), 1, 0, 0);
+                break;
+
+            case ClickEffect.Random:
+            {
+                var st = g.Save();
+                g.TranslateTransform(cx, cy);
+                g.RotateTransform(-12);
+                float hs = u * 0.62f;
+                using (var path = Round(new RectangleF(-hs, -hs, hs * 2, hs * 2), hs * 0.35f))
+                {
+                    if (sel) using (var br = Grad(new RectangleF(-hs, -hs, hs * 2, hs * 2), UI.Accent, 45f)) g.FillPath(br, path);
+                    else using (var b = new SolidBrush(gray)) g.FillPath(b, path);
+                }
+                float pr = hs * 0.16f;
+                using (var b = new SolidBrush(sel ? Color.White : UI.Card))
+                    foreach (var pt in new[] { new PointF(-0.5f, -0.5f), new PointF(0.5f, -0.5f), new PointF(0, 0), new PointF(-0.5f, 0.5f), new PointF(0.5f, 0.5f) })
+                        g.FillEllipse(b, pt.X * hs - pr, pt.Y * hs - pr, pr * 2, pr * 2);
+                g.Restore(st);
+                break;
+            }
+
+            default: // None
+                using (var pen = new Pen(gray, lw))
+                {
+                    float rr = u * 0.6f;
+                    g.DrawEllipse(pen, cx - rr, cy - rr, rr * 2, rr * 2);
+                    g.DrawLine(pen, cx - rr * 0.7f, cy + rr * 0.7f, cx + rr * 0.7f, cy - rr * 0.7f);
+                }
+                break;
         }
     }
 
@@ -836,16 +1253,38 @@ class PillButton : FancyControl
 class PreviewPanel : FancyControl
 {
     public readonly ParticleSystem Sys;
+    readonly Settings s;
+    readonly Random rng = new Random();
     double now, ghostT;
+    float demoT = 1.6f;
     PointF last;
     bool hasLast, wasInside;
 
-    public PreviewPanel(Settings s)
+    public PreviewPanel(Settings settings)
     {
+        s = settings;
         Sys = new ParticleSystem(s, UI.S);
         Sys.Max = 350;
+        Sys.HardMax = 1200;
+        Sys.EffectScale = 0.55f;
         BackColor = UI.Bg;
         Cursor = Cursors.Default;
+    }
+
+    // Plays the current click effect somewhere sensible in the preview.
+    public void Demo()
+    {
+        if (s.ClickEffect == ClickEffect.None) return;
+        float y = Height * (s.ClickEffect == ClickEffect.Fireworks ? 0.88f : 0.6f);
+        Sys.Click(Width * (0.3f + 0.4f * (float)rng.NextDouble()), y, 0);
+        demoT = 0;
+    }
+
+    protected override void OnMouseDown(MouseEventArgs e)
+    {
+        if (e.Button == MouseButtons.Left || (e.Button == MouseButtons.Right && s.ClickRight))
+            Sys.Click(e.X, e.Y, 0);
+        base.OnMouseDown(e);
     }
 
     public void Step(float dt, double t)
@@ -863,6 +1302,7 @@ class PreviewPanel : FancyControl
         }
         if (hasLast && inside == wasInside) Sys.Emit(last.X, last.Y, p.X, p.Y, dt);
         last = p; hasLast = true; wasInside = inside;
+        if (!inside && s.ClickEffect != ClickEffect.None && (demoT += dt) > 2.8f) Demo();
         Sys.Update(dt);
         Invalidate();
     }
@@ -888,7 +1328,7 @@ class PreviewPanel : FancyControl
                 g.DrawString("LIVE PREVIEW", UI.SmallBold, b, UI.D(14), UI.D(10));
             if (!wasInside)
                 using (var b = new SolidBrush(Color.FromArgb(150, UI.Sub)))
-                    g.DrawString("Move your mouse in here to play", UI.Small, b, new RectangleF(0, Height - UI.D(34), Width, UI.D(24)), UI.Center);
+                    g.DrawString("Move or click in here to play", UI.Small, b, new RectangleF(0, Height - UI.D(34), Width, UI.D(24)), UI.Center);
             g.Restore(st);
             using (var pen = new Pen(UI.CardBorder, 1f)) g.DrawPath(pen, path);
         }
@@ -904,9 +1344,10 @@ class SettingsForm : Form
     readonly Settings s;
     readonly Dictionary<Palette, Chip> paletteChips = new Dictionary<Palette, Chip>();
     readonly Dictionary<Sprite, Chip> spriteChips = new Dictionary<Sprite, Chip>();
+    readonly Dictionary<ClickEffect, Chip> effectChips = new Dictionary<ClickEffect, Chip>();
     readonly List<Tuple<Slider, Func<float>>> sliders = new List<Tuple<Slider, Func<float>>>();
     readonly Swatch[] swatches = new Swatch[3];
-    readonly Toggle enabledToggle, startupToggle;
+    readonly Toggle enabledToggle, startupToggle, rightClickToggle;
     readonly PreviewPanel preview;
     readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
     readonly Stopwatch clock = Stopwatch.StartNew();
@@ -916,6 +1357,21 @@ class SettingsForm : Form
     static readonly Rectangle PaletteCard = new Rectangle(24, 92, 420, 214);
     static readonly Rectangle SpriteCard = new Rectangle(24, 318, 420, 238);
     static readonly Rectangle BehaviourCard = new Rectangle(456, 318, 420, 238);
+    static readonly Rectangle ClickCard = new Rectangle(888, 92, 276, 464);
+
+    static string EffectBlurb(ClickEffect fx)
+    {
+        switch (fx)
+        {
+            case ClickEffect.Fireworks: return "A rocket shoots up from your click and bursts: peony, ring, willow or crackle.";
+            case ClickEffect.Burst: return "Your chosen sprites explode outward from the click.";
+            case ClickEffect.Ripple: return "Rings of light ripple out like a drop hitting water.";
+            case ClickEffect.Confetti: return "A party popper of tumbling confetti.";
+            case ClickEffect.Hearts: return "A little bouquet of hearts floats up.";
+            case ClickEffect.Random: return "Surprise me: a different effect on every click.";
+            default: return "Clicks don't do anything special.";
+        }
+    }
 
     static int D(float v) { return UI.D(v); }
     static Rectangle DR(int x, int y, int w, int h) { return new Rectangle(D(x), D(y), D(w), D(h)); }
@@ -933,11 +1389,11 @@ class SettingsForm : Form
         ForeColor = UI.Text;
         DoubleBuffered = true;
         KeyPreview = true;
-        ClientSize = new Size(D(900), D(630));
+        ClientSize = new Size(D(1188), D(630));
         logo = Gfx.MakeLogo(D(48));
 
         // header
-        enabledToggle = new Toggle { Text = "Sparkles on", BackColor = UI.Bg, Bounds = DR(736, 32, 140, 32) };
+        enabledToggle = new Toggle { Text = "Sparkles on", BackColor = UI.Bg, Bounds = DR(1024, 32, 140, 32) };
         enabledToggle.Changed += v => { s.Enabled = v; };
         Controls.Add(enabledToggle);
 
@@ -1006,16 +1462,32 @@ class SettingsForm : Form
         preview = new PreviewPanel(s) { Bounds = DR(456, 92, 420, 214) };
         Controls.Add(preview);
 
+        // click effects
+        var effects = (ClickEffect[])Enum.GetValues(typeof(ClickEffect));
+        for (int i = 0; i < effects.Length; i++)
+        {
+            var fx = effects[i];
+            var chip = new Chip { Text = fx.ToString(), Bounds = DR(904 + (i % 2) * 126, 134 + (i / 2) * 64, 118, 58) };
+            chip.Art = (g, r, sel) => Gfx.DrawEffectIcon(g, r, fx, sel);
+            chip.Click += (o, e) => { s.ClickEffect = fx; SyncUI(); preview.Demo(); };
+            effectChips[fx] = chip;
+            Controls.Add(chip);
+        }
+        AddSlider(DR(898, 446, 256, 44), "Power", 0.3f, 2f, 1f, mult, () => s.ClickPower, v => s.ClickPower = v);
+        rightClickToggle = new Toggle { Text = "Right-click too", Bounds = DR(904, 504, 244, 32) };
+        rightClickToggle.Changed += v => { s.ClickRight = v; };
+        Controls.Add(rightClickToggle);
+
         // footer
         startupToggle = new Toggle { Text = "Start with Windows", BackColor = UI.Bg, Bounds = DR(24, 576, 230, 32) };
         startupToggle.Changed += v => { try { Startup.Set(v); } catch { } };
         Controls.Add(startupToggle);
 
-        var reset = new PillButton { Text = "Reset to defaults", BackColor = UI.Bg, Bounds = DR(594, 574, 150, 36) };
+        var reset = new PillButton { Text = "Reset to defaults", BackColor = UI.Bg, Bounds = DR(882, 574, 150, 36) };
         reset.Click += (o, e) => { s.ResetLook(); SyncUI(); };
         Controls.Add(reset);
 
-        var done = new PillButton { Text = "Done", Primary = true, BackColor = UI.Bg, Bounds = DR(756, 574, 120, 36) };
+        var done = new PillButton { Text = "Done", Primary = true, BackColor = UI.Bg, Bounds = DR(1044, 574, 120, 36) };
         done.Click += (o, e) => Close();
         Controls.Add(done);
 
@@ -1054,7 +1526,12 @@ class SettingsForm : Form
 
     void AddSlider(int i, string label, float min, float max, float def, Func<float, string> fmt, Func<float> get, Action<float> set)
     {
-        var sl = new Slider { Label = label, Min = min, Max = max, Default = def, Format = fmt, Bounds = DR(472 + (i % 2) * 202, 356 + (i / 2) * 46, 186, 44) };
+        AddSlider(DR(472 + (i % 2) * 202, 356 + (i / 2) * 46, 186, 44), label, min, max, def, fmt, get, set);
+    }
+
+    void AddSlider(Rectangle bounds, string label, float min, float max, float def, Func<float, string> fmt, Func<float> get, Action<float> set)
+    {
+        var sl = new Slider { Label = label, Min = min, Max = max, Default = def, Format = fmt, Bounds = bounds };
         sl.Changed += v => set(v);
         sliders.Add(Tuple.Create(sl, get));
         Controls.Add(sl);
@@ -1078,6 +1555,9 @@ class SettingsForm : Form
     {
         foreach (var kv in paletteChips) { kv.Value.Selected = kv.Key == s.Palette; kv.Value.Invalidate(); }
         foreach (var kv in spriteChips) { kv.Value.Selected = s.Has(kv.Key); kv.Value.Invalidate(); }
+        foreach (var kv in effectChips) { kv.Value.Selected = kv.Key == s.ClickEffect; kv.Value.Invalidate(); }
+        rightClickToggle.Checked = s.ClickRight; rightClickToggle.Invalidate();
+        Invalidate(); // effect description
         for (int i = 0; i < swatches.Length; i++) { swatches[i].Color = s.Custom[i]; swatches[i].Invalidate(); }
         foreach (var t in sliders) { t.Item1.Value = t.Item2(); t.Item1.Invalidate(); }
         enabledToggle.Checked = s.Enabled; enabledToggle.Invalidate();
@@ -1133,6 +1613,10 @@ class SettingsForm : Form
         DrawCard(g, PaletteCard, "Palette", "tap to apply");
         DrawCard(g, SpriteCard, "Sprites", "mix & match");
         DrawCard(g, BehaviourCard, "Behaviour", "drag, scroll, double-click to reset");
+        DrawCard(g, ClickCard, "Click effects", "try one in the preview");
+        using (var b = new SolidBrush(UI.Sub))
+        using (var sf = new StringFormat { Alignment = StringAlignment.Near, LineAlignment = StringAlignment.Center })
+            g.DrawString(EffectBlurb(s.ClickEffect), UI.Small, b, new RectangleF(D(904), D(394), D(244), D(48)), sf);
 
         using (var b = new SolidBrush(UI.Text))
             g.DrawString("Custom colours", UI.Body, b, new RectangleF(D(40), D(252), D(200), D(30)), UI.LeftMid);
@@ -1256,8 +1740,10 @@ class SparkleContext : ApplicationContext
     SettingsForm form;
     EventWaitHandle showEvent;
     ToolStripMenuItem pauseItem, startupItem;
+    readonly Dictionary<ClickEffect, ToolStripMenuItem> effectItems = new Dictionary<ClickEffect, ToolStripMenuItem>();
     double lastTime, lastTopmost;
     Point lastPos;
+    bool wasLeft, wasRight;
 
     public SparkleContext()
     {
@@ -1331,6 +1817,25 @@ class SparkleContext : ApplicationContext
         }
         menu.Items.Add(colours);
 
+        var clicks = Item("Click effect", null);
+        clicks.DropDown.Renderer = renderer;
+        clicks.DropDown.Font = UI.Body;
+        clicks.DropDown.Padding = new Padding(0, UI.D(4), 0, UI.D(4));
+        clicks.DropDown.Opened += (o, e) => Native.RoundCorners(clicks.DropDown.Handle);
+        foreach (ClickEffect fx in Enum.GetValues(typeof(ClickEffect)))
+        {
+            var ff = fx;
+            var item = Item(fx.ToString(), (o, e) =>
+            {
+                s.ClickEffect = ff;
+                s.Save();
+                if (FormOpen) form.SyncUI();
+            });
+            effectItems[fx] = item;
+            clicks.DropDownItems.Add(item);
+        }
+        menu.Items.Add(clicks);
+
         menu.Items.Add(new ToolStripSeparator());
         startupItem = Item("Start with Windows", (o, e) =>
         {
@@ -1345,6 +1850,7 @@ class SparkleContext : ApplicationContext
         {
             pauseItem.Text = s.Enabled ? "Pause sparkles" : "Resume sparkles";
             try { startupItem.Checked = Startup.IsEnabled(); } catch { }
+            foreach (var kv in effectItems) kv.Value.Checked = kv.Key == s.ClickEffect;
             foreach (var kv in paletteItems)
             {
                 kv.Value.Checked = kv.Key == s.Palette;
@@ -1407,11 +1913,23 @@ class SparkleContext : ApplicationContext
         Point pos;
         Native.GetCursorPos(out pos);
 
+        // Poll the buttons rather than hooking the mouse; GetAsyncKeyState reports physical buttons.
+        bool swapped = Native.GetSystemMetrics(23) != 0; // SM_SWAPBUTTON
+        bool left = (Native.GetAsyncKeyState(swapped ? 2 : 1) & 0x8000) != 0;
+        bool right = (Native.GetAsyncKeyState(swapped ? 1 : 2) & 0x8000) != 0;
+        bool clicked = (left && !wasLeft) || (s.ClickRight && right && !wasRight);
+        wasLeft = left; wasRight = right;
+
         if (s.Enabled)
         {
             // the settings window has its own preview; don't double up over it
             bool overPreview = FormOpen && form.Visible && form.PreviewScreenRect.Contains(pos);
-            if (!overPreview) sys.Emit(lastPos.X, lastPos.Y, pos.X, pos.Y, dt);
+            if (!overPreview)
+            {
+                sys.Emit(lastPos.X, lastPos.Y, pos.X, pos.Y, dt);
+                if (clicked && s.ClickEffect != ClickEffect.None)
+                    sys.Click(pos.X, pos.Y, Screen.FromPoint(pos).Bounds.Top);
+            }
         }
         else if (sys.Particles.Count > 0) sys.Particles.Clear();
         lastPos = pos;
@@ -1519,6 +2037,8 @@ static class Native
 
     [DllImport("user32.dll")] public static extern bool GetCursorPos(out Point p);
     [DllImport("user32.dll")] public static extern bool AllowSetForegroundWindow(int processId);
+    [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
+    [DllImport("user32.dll")] public static extern int GetSystemMetrics(int index);
     [DllImport("user32.dll")] public static extern IntPtr GetDC(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern int ReleaseDC(IntPtr hWnd, IntPtr hDc);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int cmd);
